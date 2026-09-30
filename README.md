@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="header.png" alt="Abraxas Labs — n8n-databricks-path-join" width="100%">
+  <img src="header.png" alt="Abraxas Labs - n8n-databricks-path-join" width="100%">
 </p>
 
 <p align="center">
@@ -14,160 +14,69 @@
 
 # n8n-databricks-path-join
 
-**n8n** `2.42.0` — n8n GmbH
+**n8n** `2.42.0` - n8n GmbH
 
-Unpublished n8n source finding: Databricks Genie/Vector Search/Files concatenate attacker-controlled path ids without toPathSegment. WHATWG URL normalization turns ../ into GET /api/2.0/secrets/get under the workflow workspace token. Distinct from GHSA-89p4 / GHSA-rqch, which patched other nodes' concat. LangChain VectorStoreDatabricks already uses toPathSegment.
+[GHSA-89p4-6h98-c7xm](https://github.com/n8n-io/n8n/security/advisories/GHSA-89p4-6h98-c7xm) and [GHSA-rqch-9jrh-cr8w](https://github.com/n8n-io/n8n/security/advisories/GHSA-rqch-9jrh-cr8w) introduced [`toPathSegment`](https://github.com/n8n-io/n8n/blob/n8n%402.42.0/packages/workflow/src/url.ts): `encodeURIComponent` plus reject `''` / `.` / `..`. [`getSpace.operation.ts`](https://github.com/n8n-io/n8n/blob/n8n%402.42.0/packages/nodes-base/nodes/Databricks/actions/genie/getSpace.operation.ts) concatenates `spaceId` into `${host}/api/2.0/genie/spaces/${spaceId}`. Vector Search `getIndex` and Files `downloadFile` are the same class. LangChain [`VectorStoreDatabricks`](https://github.com/n8n-io/n8n/blob/n8n%402.42.0/packages/%40n8n/nodes-langchain/nodes/vector_store/VectorStoreDatabricks/DatabricksVectorStore.ts) already wraps the index path. WHATWG `new URL` does the rest. `../` normalizes. The workflow's Databricks PAT goes with it.
+
+**Untrusted webhook input becomes `GET /api/2.0/secrets/get` under the workspace token. Credential leak on Databricks, not n8n host RCE.**
 
 | | |
 |---|---|
-| ID | Unpublished n8n source finding #2 (no CVE yet) |
+| ID | no CVE yet |
 | CWE | [CWE-22](https://cwe.mitre.org/data/definitions/22.html) |
 | CVSS | **High: 8.6** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N` |
 | Product | [n8n](https://github.com/n8n-io/n8n) |
-| Affected | all versions **through 2.42.0** (inclusive) |
-| Patched | vendor patch — see references |
-| Auth | unauthenticated (see source map) |
+| Affected | through **2.42.0** (`86c23326`); sibling of GHSA-89p4 / GHSA-rqch |
+| Auth | unauthenticated at the webhook if a victim workflow bound untrusted input |
 | License | [GNU Affero GPL v3.0](LICENSE) |
-| Lab | `127.0.0.1` only · vendor/client disclosure pack, not a scanner |
+| Lab | `127.0.0.1` only |
 
----
+## What an attacker can do
 
-## Advisory (from the source map)
+Hit a public webhook, chat, or HTTP trigger that flows into Databricks Genie get-space (or Vector Search get-index, or Files download) with an attacker-controlled id. The workflow token then `GET`s `/api/2.0/secrets/get`. If that token may read the scope (typical workspace admin PAT), the node output is the secret `value` JSON.
 
-getSpace.operation.ts 8-12 concat ${host}/api/2.0/genie/spaces/${spaceId}. vectorSearch/getIndex.operation.ts and files/downloadFile.operation.ts same class. Contrast packages/workflow/src/url.ts toPathSegment. Contrast VectorStoreDatabricks toPathSegment. GHSA-89p4 / GHSA-rqch patched other nodes' concat.
+Token without secrets ACL still 403s; that still proves the request left `/genie`. Files download needs a deeper `../` (longer prefix). Needs a victim who bound untrusted input into that parameter. A locked-down HTTP Request node (`allowedHttpRequestDomains: none`) is not a substitute for encoding the Databricks ids.
 
----
+Same product, sibling leftover: [hidden Function vm2](https://github.com/abraxas/n8n-function-vm2).
 
-## Entry
+## How I found it
 
-- **Method:** `POST`
-- **Path:** `/webhook/dbx-space`
-- **Router:** Databricks Genie getSpace concatenates host + /api/2.0/genie/spaces/${spaceId} with no toPathSegment. WHATWG/undici new URL normalizes ../ and splits ? so GET becomes /api/2.0/secrets/get under the workflow token.
-- **Notes:** Unauthenticated unpublished n8n #2 CWE-22 n8n@2.42.0. Needs a victim workflow with a databricksApi credential and untrusted spaceId from a public webhook. Witness: mock GET /api/2.0/secrets/get and N8N-DBX-SECRET-WITNESS in the webhook body. Not n8n host RCE. Disclose GitHub Security Advisories only, not a public GitHub issue.
+Same leftover pass as the Function lab: ten hunts on **n8n@2.42.0** after the 16 September 2026 GHSA wave. The node-injection hunt was looking for incomplete siblings of GHSA-89p4 (Public API resource ids) and GHSA-rqch (Supabase table name). Elastic, Adalo, Currents, the n8n node itself. The helper exists because they already lost this fight. Databricks nodes-base does not call it.
 
-### Call chain
+I did not aim this at a real workspace. Lab mock on `:18203` answers `GET /api/2.0/secrets/get` with `N8N-DBX-SECRET-WITNESS`. n8n on `:18202`. Webhook `dbx-space` binds `spaceId` from JSON. Mock access log: `GET /api/2.0/secrets/get?scope=s&key=k`. Webhook body contains the witness.
 
-- `POST /rest/owner/setup`
-- `POST /rest/login`
-- `POST /rest/credentials type=databricksApi host=mock`
-- `POST /rest/workflows Webhook -&gt; Databricks Genie getSpace spaceId={{ $json.body.spaceId }}`
-- `POST /rest/workflows/:id/activate`
-- `POST /webhook/dbx-space {"spaceId":"../../secrets/get?scope=s&key=k"}`
+Wrong turns already recorded: request staying under `/api/2.0/genie/spaces/` (then `..` was encoded - lab requires it left); treating n8n host RCE as SUCCESS; hitting a real workspace; a reverse shell. Theatre. The witness is `N8N-DBX-SECRET-WITNESS` plus the mock request line.
 
-### Lab preconditions
-
-- n8n 2.42.0 (n8nio/n8n:2.42.0)
-- Victim workflow with databricksApi credential bound to untrusted spaceId
-- Public webhook (or chat/HTTP) that writes spaceId from JSON
-- Workspace token that may GET /api/2.0/secrets/get (lab uses a loopback mock)
-
-### Witness
-
-N8N-DBX-SECRET-WITNESS in webhook body; mock access log GET /api/2.0/secrets/get?scope=s&key=k
-
-### Not success
-
-- eval/base64/system payload
-- reverse shell
-- n8n host RCE
-- ../ stays encoded under /genie/spaces/
-- request never leaves /api/2.0/genie/spaces/
-
----
-
-## Patch / remediation
-
-**Do this first:** Apply the vendor patch for **n8n**. See references.
-
-**Verify after upgrade**
-
-- Re-run `n8n-databricks-path-join-Abraxas-Labs.py` against the patched build: the mapped witness must **not** appear.
-- Confirm the vendor advisory / changeset in the deployed tree (see references).
-- A WAF signature is delay, not a patch.
-
-**If you cannot update immediately**
-
-- Disable or isolate the affected component.
-- Hunt for the witness condition on production (new privileged users, unexpected files, injected rows — whatever this CVE's map names).
-
----
-
-## Reproduction (authorized lab)
-
-Target **only** `http://127.0.0.1:18202` (n8n) and `http://127.0.0.1:18203` (Databricks mock). Do not point this script at the internet.
-
-Official image `n8nio/n8n:2.42.0` on loopback `:18202` plus the mock on `:18203`. Then:
+## Lab
 
 ```bash
 cd lab
 ./run.sh
 ```
 
-Or, with the stack already up:
+Target **only** `http://127.0.0.1:18202` (n8n) and `:18203` (mock). Credential host is the mock, not a real workspace.
 
-```bash
-python3 n8n-databricks-path-join-Abraxas-Labs.py http://127.0.0.1:18202 http://127.0.0.1:18203
+```text
+webhook-http=200
+mock-request-line=GET /api/2.0/secrets/get?scope=s&key=k
+webhook-witness=True
+mock-secrets-get=True
+witness=N8N-DBX-SECRET-WITNESS
+SUCCESS N8N-DBX-PATH-JOIN
 ```
 
-Success is `N8N-DBX-SECRET-WITNESS` in the webhook body and mock `GET /api/2.0/secrets/get`. Generic 200 HTML is not it.
+## The fix
 
----
-
-## Lab images
-
-Loopback stack used to reproduce. Official images unless a `Dockerfile` in this folder builds from source.
-
-- [`lab/docker-compose.yml`](lab/docker-compose.yml)
-- [`lab/Dockerfile`](lab/Dockerfile)
-- [`lab/run.sh`](lab/run.sh)
-- [`lab/mock/Dockerfile`](lab/mock/Dockerfile)
-- [`lab/mock/server.py`](lab/mock/server.py)
-
-Publish nothing except `127.0.0.1`.
-
----
+Wrap every Databricks path id with `toPathSegment`, same as VectorStoreDatabricks.
 
 ## References
 
-- [github.com/n8n-io/n8n](https://github.com/n8n-io/n8n) tag n8n@2.42.0
-- Sibling leftover: [GHSA-89p4-6h98-c7xm](https://github.com/n8n-io/n8n/security/advisories/GHSA-89p4-6h98-c7xm) · [GHSA-rqch-9jrh-cr8w](https://github.com/n8n-io/n8n/security/advisories/GHSA-rqch-9jrh-cr8w)
-- Vendor intake: [GitHub Security Advisories](https://github.com/n8n-io/n8n/security/advisories/new). Do **not** open a public GitHub issue.
-
-- Abraxas Labs: [abraxaslabs.tech](https://abraxaslabs.tech) · [github.com/abraxas](https://github.com/abraxas) · [@abraxas_null](https://x.com/abraxas_null)
-
----
-
-## Records (structured)
-
-```
-# n8n unpublished #2 — Databricks path join reaches Secrets API
-
-CWE: CWE-22
-Severity: High (HTTP lab SUCCESS, 80%)
-
-## Description
-
-Databricks Genie `getSpace` concatenates `spaceId` into `${host}/api/2.0/genie/spaces/${spaceId}` with no `toPathSegment`. A public webhook that binds untrusted JSON into that id lets WHATWG URL normalize `../` and split `?`, so the workflow token issues `GET /api/2.0/secrets/get`. Same class as GHSA-89p4 / GHSA-rqch. LangChain VectorStoreDatabricks already encodes the index path.
-
-## Product
-
-n8n 2.42.0 (`n8nio/n8n:2.42.0`). Lab oracle: `N8N-DBX-SECRET-WITNESS` in the webhook body and mock `GET /api/2.0/secrets/get?scope=s&key=k`. Credential leak on the Databricks tenant, not n8n RCE.
-```
-
----
+- [github.com/n8n-io/n8n](https://github.com/n8n-io/n8n) tag [n8n@2.42.0](https://github.com/n8n-io/n8n/releases/tag/n8n%402.42.0)
+- [`getSpace.operation.ts`](https://github.com/n8n-io/n8n/blob/n8n%402.42.0/packages/nodes-base/nodes/Databricks/actions/genie/getSpace.operation.ts) · [`toPathSegment`](https://github.com/n8n-io/n8n/blob/n8n%402.42.0/packages/workflow/src/url.ts) · [`DatabricksVectorStore.ts`](https://github.com/n8n-io/n8n/blob/n8n%402.42.0/packages/%40n8n/nodes-langchain/nodes/vector_store/VectorStoreDatabricks/DatabricksVectorStore.ts)
+- Nearby patched: [GHSA-89p4-6h98-c7xm](https://github.com/n8n-io/n8n/security/advisories/GHSA-89p4-6h98-c7xm) · [GHSA-rqch-9jrh-cr8w](https://github.com/n8n-io/n8n/security/advisories/GHSA-rqch-9jrh-cr8w)
+- Same product: [n8n-function-vm2](https://github.com/abraxas/n8n-function-vm2)
+- [CWE-22](https://cwe.mitre.org/data/definitions/22.html)
 
 ## License
 
-This disclosure pack is licensed under the **GNU Affero General Public License v3.0**. See [LICENSE](LICENSE).
-
----
-
-## Disclaimer
-
-This pack is for **the vendor, the site owner, and licensed labs**. The script talks to `127.0.0.1`. Using it against systems you do not own is not authorized by Abraxas Labs. No warranty.
-
-<p align="center">
-  <a href="https://abraxaslabs.tech">abraxaslabs.tech</a> ·
-  <a href="https://github.com/abraxas">github.com/abraxas</a> ·
-  <a href="https://x.com/abraxas_null">@abraxas_null</a>
-</p>
+GNU Affero GPL v3.0. See [LICENSE](LICENSE). Loopback lab only. No warranty.

@@ -1,13 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-export COMPOSE_PROJECT_NAME=n8n-databricks-path-join
-chmod +x poc.py
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-n8n-databricks-path-join}"
+
+N8N_URL="http://127.0.0.1:18202"
+MOCK_URL="http://127.0.0.1:18203"
+HEALTH_TMP="/tmp/n8n-databricks-path-join-health"
 
 down() {
   echo "== docker compose down =="
   docker compose down -v || true
 }
+
+write_fail() {
+  local reason="$1"
+  echo "FAIL ${reason}" | tee poc-last-run.txt
+  echo "FAIL N8N-DBX-PATH-JOIN" | tee -a poc-last-run.txt
+}
+
+wait_n8n() {
+  local i code
+  for i in $(seq 1 90); do
+    code="$(curl -s -o "${HEALTH_TMP}" -w '%{http_code}' --max-time 5 "${N8N_URL}/healthz" || true)"
+    if [[ "${code}" == "200" ]]; then
+      echo "IOC n8n-up http=${code}"
+      return 0
+    fi
+    echo "IOC wait-n8n i=${i} http=${code}"
+    sleep 3
+  done
+  return 1
+}
+
+wait_mock() {
+  local i code
+  for i in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${MOCK_URL}/health" || true)"
+    if [[ "${code}" == "200" ]]; then
+      echo "IOC mock-up http=${code}"
+      return 0
+    fi
+    echo "IOC wait-mock i=${i} http=${code}"
+    sleep 2
+  done
+  return 1
+}
+
+chmod +x poc.py
 
 echo "== docker compose up (n8nio/n8n:2.42.0 + mock, loopback :18202/:18203) =="
 up_ok=0
@@ -16,52 +55,27 @@ for attempt in $(seq 1 8); do
     up_ok=1
     break
   fi
-  echo "IOC compose-up-retry attempt=$attempt"
+  echo "IOC compose-up-retry attempt=${attempt}"
   sleep 10
 done
-if [[ "$up_ok" != 1 ]]; then
-  echo "FAIL docker compose up" | tee poc-last-run.txt
-  echo "FAIL N8N-DBX-PATH-JOIN" | tee -a poc-last-run.txt
+if [[ "${up_ok}" != 1 ]]; then
+  write_fail "docker compose up"
   docker compose logs --tail=80 || true
   down
   exit 1
 fi
 
 echo "== wait for n8n =="
-ok=0
-for i in $(seq 1 90); do
-  code="$(curl -s -o /tmp/n8n-databricks-path-join-health -w '%{http_code}' --max-time 5 http://127.0.0.1:18202/healthz || true)"
-  if [[ "$code" == "200" ]]; then
-    echo "IOC n8n-up http=$code"
-    ok=1
-    break
-  fi
-  echo "IOC wait-n8n i=$i http=$code"
-  sleep 3
-done
-if [[ "$ok" != 1 ]]; then
-  echo "FAIL n8n did not become ready" | tee poc-last-run.txt
-  echo "FAIL N8N-DBX-PATH-JOIN" | tee -a poc-last-run.txt
+if ! wait_n8n; then
+  write_fail "n8n did not become ready"
   docker compose logs --tail=120 n8n | tee -a poc-last-run.txt || true
   down
   exit 1
 fi
 
 echo "== wait for mock =="
-ok=0
-for i in $(seq 1 30); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18203/health || true)"
-  if [[ "$code" == "200" ]]; then
-    echo "IOC mock-up http=$code"
-    ok=1
-    break
-  fi
-  echo "IOC wait-mock i=$i http=$code"
-  sleep 2
-done
-if [[ "$ok" != 1 ]]; then
-  echo "FAIL mock did not become ready" | tee poc-last-run.txt
-  echo "FAIL N8N-DBX-PATH-JOIN" | tee -a poc-last-run.txt
+if ! wait_mock; then
+  write_fail "mock did not become ready"
   docker compose logs --tail=80 mock | tee -a poc-last-run.txt || true
   down
   exit 1
@@ -69,12 +83,12 @@ fi
 
 echo "== poc.py =="
 set +e
-python3 poc.py http://127.0.0.1:18202 http://127.0.0.1:18203 | tee poc-last-run.txt
+python3 poc.py "${N8N_URL}" "${MOCK_URL}" | tee poc-last-run.txt
 rc=${PIPESTATUS[0]}
 set -e
-if [[ "$rc" != 0 ]]; then
+if [[ "${rc}" != 0 ]]; then
   echo "== compose logs (tail) ==" | tee -a poc-last-run.txt
   docker compose logs --tail=120 n8n mock | tee -a poc-last-run.txt || true
 fi
 down
-exit "$rc"
+exit "${rc}"

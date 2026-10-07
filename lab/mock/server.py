@@ -9,18 +9,30 @@ from urllib.parse import urlparse
 
 WITNESS = "N8N-DBX-SECRET-WITNESS"
 SECRET_PATH = "/api/2.0/secrets/get"
-LOG_LOCK = threading.Lock()
-ACCESS_LOG: list[str] = []
+HOST = "0.0.0.0"
+PORT = 8080
 
 
-def record(line: str) -> None:
-    with LOG_LOCK:
-        ACCESS_LOG.append(line)
-        print(line, flush=True)
+class AccessLog:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lines: list[str] = []
+
+    def record(self, line: str) -> None:
+        with self._lock:
+            self._lines.append(line)
+            print(line, flush=True)
+
+    def dump(self) -> bytes:
+        with self._lock:
+            if not self._lines:
+                return b""
+            return ("\n".join(self._lines) + "\n").encode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    access_log = AccessLog()
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -34,8 +46,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, code: int, payload: object) -> None:
-        raw = json.dumps(payload, separators=(",", ":")).encode()
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self._send(code, raw, "application/json")
+
+    def _read_body(self) -> None:
+        raw_len = self.headers.get("Content-Length") or "0"
+        try:
+            length = int(raw_len)
+        except ValueError:
+            length = 0
+        if length > 0:
+            self.rfile.read(length)
 
     def _handle(self) -> None:
         parsed = urlparse(self.path)
@@ -43,16 +64,14 @@ class Handler(BaseHTTPRequestHandler):
         qs = parsed.query
         line = f"{self.command} {self.path}"
         if path not in ("/health", "/__logs"):
-            record(line)
+            self.access_log.record(line)
 
         if path in ("/health", "/healthz"):
             self._send(200, b"ok", "text/plain")
             return
 
         if path == "/__logs":
-            with LOG_LOCK:
-                body = ("\n".join(ACCESS_LOG) + ("\n" if ACCESS_LOG else "")).encode()
-            self._send(200, body, "text/plain; charset=utf-8")
+            self._send(200, self.access_log.dump(), "text/plain; charset=utf-8")
             return
 
         if self.command == "GET" and path.rstrip("/") == SECRET_PATH:
@@ -71,21 +90,22 @@ class Handler(BaseHTTPRequestHandler):
         self._handle()
 
     def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        self._read_body()
         self._handle()
 
     def do_PUT(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        self._read_body()
         self._handle()
 
     def do_HEAD(self) -> None:  # noqa: N802
         self._handle()
 
 
-if __name__ == "__main__":
-    httpd = ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
+def main() -> int:
+    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     httpd.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

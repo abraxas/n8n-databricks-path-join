@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/n8n-databricks-path-join">n8n-databricks-path-join</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/n8n-databricks-path-join"><strong>https://abraxaslabs.tech/research/n8n-databricks-path-join</strong></a>
+</p>
+
 
 # n8n-databricks-path-join
 
